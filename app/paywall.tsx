@@ -1,64 +1,68 @@
-import { useState } from 'react';
-import { StyleSheet, Text, View } from 'react-native';
-import { router } from 'expo-router';
+// §12 Paywall. Shows on day 8, never blocks reads — it's a dismissible modal.
+// Free tier keeps reading everything; only NEW AI calls/recommendations stop (server-enforced).
+import { LinearGradient } from 'expo-linear-gradient';
+import { useRouter } from 'expo-router';
+import { useEffect, useState } from 'react';
+import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import type { PurchasesPackage } from 'react-native-purchases';
+import { Headline } from '@/components/Headline';
+import { track } from '@/lib/analytics';
+import { fetchPackages, purchase, restore } from '@/lib/purchases';
+import { c, grad, radius, t } from '@/lib/theme';
 
-import { Button } from '@/src/components/button';
-import { Screen } from '@/src/components/screen';
-import { useAuth } from '@/src/hooks/use-auth';
-import { useEntitlement } from '@/src/hooks/use-entitlement';
-import { purchase, restore } from '@/src/services/subscriptions';
-import { captureError, track } from '@/src/services/telemetry';
-import { colors, radius, spacing } from '@/src/theme/tokens';
+export default function Paywall() {
+  const router = useRouter();
+  const [packages, setPackages] = useState<PurchasesPackage[]>([]);
+  const [busy, setBusy] = useState(false);
 
-export default function PaywallScreen() {
-  const { user } = useAuth();
-  const access = useEntitlement(user?.id);
-  const [busy, setBusy] = useState<string | null>(null);
-  const [message, setMessage] = useState('');
+  useEffect(() => {
+    void fetchPackages().then(setPackages);
+  }, []);
 
-  async function buy(item: PurchasesPackage) {
-    if (!user) return;
-    setBusy(item.identifier); setMessage('');
-    try {
-      if (await purchase(user.id, item)) {
-        const type = item.packageType === 'MONTHLY' ? 'monthly' : item.packageType === 'ANNUAL' ? 'annual' : 'other';
-        track('subscribed', { packageType: type });
-        await access.refresh();
-        router.back();
-      }
-    } catch (error) { captureError(error); setMessage('Purchase was not completed. Nothing was charged here.'); }
-    finally { setBusy(null); }
-  }
-
-  async function restorePurchase() {
-    if (!user) return;
-    setBusy('restore'); setMessage('');
-    try {
-      if (await restore(user.id)) { await access.refresh(); router.back(); }
-      else setMessage('No active subscription was found for this store account.');
-    } catch (error) { captureError(error); setMessage('Restore could not connect. Try again when you are online.'); }
-    finally { setBusy(null); }
+  async function buy(pkg: PurchasesPackage) {
+    setBusy(true);
+    const ok = await purchase(pkg);
+    setBusy(false);
+    if (ok) {
+      track('subscribed');
+      router.back();
+    }
   }
 
   return (
-    <Screen eyebrow="Keep the planning layer" title="One Thing Pro">
-      <View style={styles.hero}><Text style={styles.seven}>7</Text><Text style={styles.heroTitle}>days were free. No card up front.</Text><Text style={styles.heroBody}>Your tasks, history, observations, and exports remain readable. Pro creates new daily recommendations and handles natural-language changes.</Text></View>
-      {access.packages.map((item) => <Button key={item.identifier} loading={busy === item.identifier} onPress={() => void buy(item)}>{item.product.title} · {item.product.priceString}</Button>)}
-      {!access.configured ? <View style={styles.note}><Text style={styles.noteText}>Purchases are ready in code. Add the RevenueCat public keys and current offering before release.</Text></View> : null}
-      {message ? <Text accessibilityLiveRegion="polite" style={styles.message}>{message}</Text> : null}
-      <Button loading={busy === 'restore'} variant="secondary" onPress={() => void restorePurchase()}>Restore purchases</Button>
-      <Button variant="ghost" onPress={() => router.back()}>Keep using the free reader</Button>
-    </Screen>
+    <LinearGradient colors={grad.hero} style={{ flex: 1 }}>
+    <SafeAreaView style={styles.screen}>
+      <View style={{ flex: 1, padding: 24, gap: 16, justifyContent: 'center' }}>
+        <Headline text="Keep the {plan} coming." />
+        <Text style={t.dim}>
+          Your trial's up. You can still read everything you've saved — subscribing turns the
+          daily plan, corrections, and new AI back on.
+        </Text>
+
+        {packages.length === 0 && <Text style={t.dim}>Plans load once billing is configured.</Text>}
+        {packages.map((pkg) => (
+          <Pressable key={pkg.identifier} style={styles.plan} onPress={() => buy(pkg)} disabled={busy}>
+            <Text style={t.h2}>{pkg.product.title}</Text>
+            <Text style={t.dim}>{pkg.product.priceString}</Text>
+          </Pressable>
+        ))}
+
+        {busy && <ActivityIndicator color={c.accent} />}
+
+        <Pressable onPress={async () => (await restore()) && router.back()}>
+          <Text style={[t.dim, { textAlign: 'center' }]}>Restore purchases</Text>
+        </Pressable>
+        <Pressable onPress={() => router.back()}>
+          <Text style={[t.dim, { textAlign: 'center' }]}>Not now — keep reading</Text>
+        </Pressable>
+      </View>
+    </SafeAreaView>
+    </LinearGradient>
   );
 }
 
 const styles = StyleSheet.create({
-  hero: { backgroundColor: colors.ink, borderRadius: radius.lg, padding: spacing.xl, marginBottom: spacing.lg },
-  seven: { color: colors.citrus, fontSize: 76, lineHeight: 80, fontWeight: '900' },
-  heroTitle: { color: colors.white, fontSize: 27, lineHeight: 33, fontWeight: '900' },
-  heroBody: { color: colors.mossSoft, fontSize: 15, lineHeight: 23, marginTop: spacing.sm },
-  note: { borderWidth: 1, borderColor: colors.line, borderRadius: radius.md, padding: spacing.md, marginVertical: spacing.md },
-  noteText: { color: colors.muted, fontSize: 13, lineHeight: 20 },
-  message: { color: colors.danger, fontSize: 14, lineHeight: 21, marginVertical: spacing.md },
+  screen: { flex: 1, backgroundColor: 'transparent' },
+  plan: { backgroundColor: 'rgba(23,23,31,0.85)', borderRadius: radius.md, padding: 18, borderColor: c.accent, borderWidth: 1, gap: 4 },
 });

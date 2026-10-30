@@ -1,29 +1,112 @@
-import type { EnergyResult, EngineState } from './types';
+// §5.1 Expected energy. Pure.
+import type { Energy, DaySignal, EnergyResult, Observation } from './types';
+import { dayDiff, formatDuration, mean } from './util';
 
-function mean(values: number[]) { return values.reduce((sum, value) => sum + value, 0) / values.length; }
-export function formatMinutes(minutes: number) { return `${Math.floor(minutes / 60)}h ${String(Math.round(minutes % 60)).padStart(2, '0')}m`; }
+export const BORROWED_AVG_MINS = 400; // ~6h40m borrowed population prior
 
-export function expectedEnergy(state: EngineState, day: string): EnergyResult {
-  const today = state.daySignals.find((signal) => signal.day === day);
-  if (today?.energy_stated) return { level: today.energy_stated, source: 'stated', personal: true, reasoning: `You said your energy is ${today.energy_stated}, so I’m using that instead of guessing.`, sleepMins: today.sleep_mins };
-  if (today?.sleep_mins == null) return { level: 'normal', source: 'default', personal: false, reasoning: 'No sleep data today, so I’m using a normal-energy default.', sleepMins: null };
+/** Softened once the user has corrected the low-energy call 3+ times (§9 short_nights). */
+function isSoftened(observations: Observation[]): boolean {
+  return observations.some((o) => o.key === 'short_nights' && !o.dismissed_at);
+}
 
-  const cutoff = new Date(`${day}T12:00:00Z`);
-  cutoff.setUTCDate(cutoff.getUTCDate() - 29);
-  const nights = state.daySignals.filter((signal) => signal.sleep_mins != null && signal.day >= cutoff.toISOString().slice(0, 10) && signal.day <= day).map((signal) => signal.sleep_mins!);
-  const personal = nights.length >= 5;
-  const average = personal ? mean(nights) : 400;
-  const softened = state.observations.some((observation) => observation.key === 'short_nights' && observation.evidence_count >= 3 && !observation.dismissed_at);
-  const low = today.sleep_mins < (personal ? average - 55 : 360);
-  const high = today.sleep_mins > (personal ? average + 45 : 420);
-  const level = low && !softened ? 'low' : high ? 'high' : 'normal';
-  const slept = formatMinutes(today.sleep_mins);
+const LADDER: Energy[] = ['low', 'normal', 'high'];
+function shift(e: Energy, dir: -1 | 1): Energy {
+  const i = Math.max(0, Math.min(2, LADDER.indexOf(e) + dir));
+  return LADDER[i];
+}
 
-  if (low && softened) return { level, source: personal ? 'personal' : 'borrowed', personal, sleepMins: today.sleep_mins, reasoning: `${slept}. That would normally lower today’s load, but you’ve corrected that call three times, so I’m leaving it normal.` };
-  if (!personal) {
-    const prior = level === 'low' ? 'A borrowed guide says most people run lower under 6 hours' : level === 'high' ? 'I’m using a borrowed 7-hour high-energy threshold for now' : 'I’m using a borrowed population range for now';
-    return { level, source: 'borrowed', personal: false, sleepMins: today.sleep_mins, reasoning: `${slept}. ${prior} — I’ll swap this for your own numbers once I have 15 days.` };
+export function computeEnergy(
+  daySignals: DaySignal[],
+  day: string,
+  observations: Observation[] = [],
+): EnergyResult {
+  const today = daySignals.find((d) => d.day === day);
+
+  // 1. Explicit user override wins.
+  if (today?.energy_stated) {
+    return {
+      energy: today.energy_stated,
+      source: 'stated',
+      reasoning: `You told me you're ${today.energy_stated} today.`,
+      sleepMins: today.sleep_mins ?? null,
+      personal: false,
+    };
   }
-  const comparison = level === 'low' ? 'well below' : level === 'high' ? 'well above' : 'close to';
-  return { level, source: 'personal', personal: true, sleepMins: today.sleep_mins, reasoning: `${slept}. That’s ${comparison} your recent ${formatMinutes(average)} average.` };
+
+  // 2. No sleep data -> normal/default.
+  const sleep = today?.sleep_mins ?? null;
+  if (sleep == null) {
+    return {
+      energy: 'normal',
+      source: 'default',
+      reasoning: "No sleep data yet, so I'm assuming a normal day.",
+      sleepMins: null,
+      personal: false,
+    };
+  }
+
+  // 3. Personal baseline from the prior 30 days that have sleep data.
+  // Today itself is excluded — we compare today's sleep *against* the baseline.
+  const nights = daySignals
+    .filter((d) => d.sleep_mins != null)
+    .filter((d) => {
+      const diff = dayDiff(d.day, day); // days from d.day to today; 1..30 = prior month
+      return diff >= 1 && diff <= 30;
+    })
+    .map((d) => d.sleep_mins as number);
+
+  const personal = nights.length >= 5;
+  const avg = personal ? mean(nights) : BORROWED_AVG_MINS;
+
+  const softened = isSoftened(observations);
+  const lowThreshold = personal ? avg - 55 : 360;
+  const highThreshold = personal ? avg + 45 : 420;
+
+  let energy: EnergyResult['energy'];
+  if (sleep < lowThreshold && !softened) energy = 'low';
+  else if (sleep > highThreshold) energy = 'high';
+  else energy = 'normal';
+  const baseEnergy = energy; // duration-based call, before the quality shift
+
+  // §5.1 sleep-quality shift, applied on top of the duration-based call.
+  const quality = today?.sleep_quality ?? null;
+  let qualityNote = '';
+  if (quality === 'broken') {
+    const before = energy;
+    energy = shift(energy, -1);
+    if (energy !== before) qualityNote = ' Sleep was broken, so I nudged it down.';
+  } else if (quality === 'solid' && sleep >= 360) {
+    const before = energy;
+    energy = shift(energy, 1);
+    if (energy !== before) qualityNote = ' Sleep was solid, so I nudged it up.';
+  }
+
+  const slept = formatDuration(sleep);
+  let reasoning: string;
+  if (personal) {
+    if (baseEnergy === 'low') {
+      reasoning = `${slept} — below your usual ${formatDuration(Math.round(avg))}, so I'm easing off today.`;
+    } else if (baseEnergy === 'high') {
+      reasoning = `${slept} — above your usual ${formatDuration(Math.round(avg))}, so I'll push a little harder.`;
+    } else {
+      reasoning = `${slept} — right around your usual, so a normal day.`;
+    }
+  } else {
+    // Borrowed prior: never present it as a personal finding.
+    if (baseEnergy === 'low') {
+      reasoning = `${slept}. Most people run lower under 6 hours — I'll swap this for your own numbers once I have 15 days.`;
+    } else if (baseEnergy === 'high') {
+      reasoning = `${slept}. That's a full night for most people — I'll swap this for your own numbers once I have 15 days.`;
+    } else {
+      reasoning = `${slept}. Using a general baseline for now — I'll swap it for your own numbers once I have 15 days.`;
+    }
+  }
+
+  return {
+    energy,
+    source: personal ? 'personal' : 'borrowed',
+    reasoning: reasoning + qualityNote,
+    sleepMins: sleep,
+    personal,
+  };
 }

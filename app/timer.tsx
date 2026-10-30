@@ -1,78 +1,88 @@
-import { useEffect, useMemo, useState } from 'react';
-import { Alert, Pressable, StyleSheet, Text, View } from 'react-native';
-import { Ionicons } from '@expo/vector-icons';
-import { router, useLocalSearchParams } from 'expo-router';
+// §9 Timer: work block → 5-min break → active return. Writes a sessions row on stop.
+import { useLocalSearchParams, useRouter } from 'expo-router';
+import { useEffect, useRef, useState } from 'react';
+import { Pressable, StyleSheet, Text, View } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
+import { BREAK_MINS } from '@/engine';
+import { track } from '@/lib/analytics';
+import { scheduleBreakOver } from '@/lib/notifications';
+import { supabase } from '@/lib/supabase';
+import { c, t } from '@/lib/theme';
+import { today, useLocal } from '@/store/local';
 
-import { Button } from '@/src/components/button';
-import { Screen } from '@/src/components/screen';
-import { useAuth } from '@/src/hooks/use-auth';
-import { useTimerClock } from '@/src/hooks/use-timer-clock';
-import { useTaskStore } from '@/src/stores/task-store';
-import { useTimerStore } from '@/src/stores/timer-store';
-import { colors, radius, spacing } from '@/src/theme/tokens';
-import { track } from '@/src/services/telemetry';
+export default function Timer() {
+  const router = useRouter();
+  const { taskId, mins } = useLocalSearchParams<{ taskId: string; mins: string }>();
+  const planned = Number(mins) || 45;
+  const userId = useLocal((s) => s.userId);
+  const tasks = useLocal((s) => s.tasks);
+  const title = tasks.find((x) => x.id === taskId)?.title ?? 'your task';
 
-function clock(seconds: number) {
-  return `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`;
-}
-
-export default function TimerScreen() {
-  const params = useLocalSearchParams<{ taskId?: string; minutes?: string }>();
-  const { user } = useAuth();
-  const tasks = useTaskStore((state) => state.tasks);
-  const storedTaskId = useTimerStore((state) => state.taskId);
-  const taskTitle = useTimerStore((state) => state.taskTitle);
-  const start = useTimerStore((state) => state.start);
-  const finishWork = useTimerStore((state) => state.finishWork);
-  const stop = useTimerStore((state) => state.stop);
-  const interrupt = useTimerStore((state) => state.interrupt);
-  const interruptions = useTimerStore((state) => state.interruptions);
-  const returnToTask = useTimerStore((state) => state.returnToTask);
-  const { phase, remainingSeconds } = useTimerClock();
-  const [error, setError] = useState('');
-  const task = useMemo(() => tasks.find((item) => item.id === (params.taskId ?? storedTaskId)), [params.taskId, storedTaskId, tasks]);
-  const minutes = Math.max(1, Number(params.minutes) || 45);
+  const [phase, setPhase] = useState<'work' | 'break'>('work');
+  const [left, setLeft] = useState(planned * 60);
+  const startedAt = useRef(Date.now());
 
   useEffect(() => {
-    if (phase !== 'idle' || !task || !user) return;
-    void start(task, user.id, minutes).then(() => track('session_started', { plannedMins: minutes })).catch(() => setError('The timer started, but the session could not sync yet.'));
-  }, [minutes, phase, start, task, user]);
+    track('session_started');
+    const iv = setInterval(() => setLeft((s) => Math.max(0, s - 1)), 1000);
+    return () => clearInterval(iv);
+  }, []);
 
-  const label = phase === 'work' ? 'FOCUS BLOCK' : phase === 'break' ? 'FIVE-MINUTE BREAK' : 'BREAK’S OVER';
-  const title = phase === 'break' ? 'Step away. Come back clean.' : taskTitle ?? task?.title ?? 'Choose a task first';
+  useEffect(() => {
+    if (left > 0) return;
+    if (phase === 'work') {
+      void writeSession(true);
+      scheduleBreakOver(BREAK_MINS * 60, title);
+      setPhase('break');
+      setLeft(BREAK_MINS * 60);
+    }
+  }, [left, phase]);
 
-  async function stopEarly() {
-    await stop().catch(() => setError('The session is saved on this device but has not synced.'));
-    track('session_completed', { plannedMins: minutes, completed: false });
-    router.back();
+  async function writeSession(completed: boolean) {
+    const actual = Math.round((Date.now() - startedAt.current) / 60000);
+    if (userId)
+      await supabase.from('sessions').insert({
+        user_id: userId,
+        task_id: taskId,
+        day: today(),
+        planned_mins: planned,
+        actual_mins: actual,
+        completed,
+      });
+    if (completed) track('session_completed');
   }
 
+  const mm = String(Math.floor(left / 60)).padStart(2, '0');
+  const ss = String(left % 60).padStart(2, '0');
+
   return (
-    <Screen scroll={false}>
-      <View style={styles.top}><Pressable accessibilityLabel="Close timer" onPress={() => Alert.alert('Stop this block?', 'Your actual time will still be saved.', [{ text: 'Keep working' }, { text: 'Stop', style: 'destructive', onPress: () => void stopEarly() }])} style={styles.close}><Ionicons color={colors.ink} name="close" size={26} /></Pressable><Text style={styles.label}>{label}</Text><View style={styles.close} /></View>
+    <SafeAreaView style={styles.screen}>
+      {phase === 'break' && (
+        <View style={styles.banner}>
+          <Text style={{ color: '#fff', fontWeight: '600' }}>Break — back to {title} soon.</Text>
+        </View>
+      )}
       <View style={styles.center}>
-        <Text style={styles.title}>{title}</Text>
-        <Text accessibilityLabel={`${Math.floor(remainingSeconds / 60)} minutes ${remainingSeconds % 60} seconds remaining`} style={styles.clock}>{phase === 'return' ? '00:00' : clock(remainingSeconds)}</Text>
-        <Text style={styles.sub}>{phase === 'work' ? 'One task. Notifications can wait.' : phase === 'break' ? 'No inbox. No next task. Just five.' : 'The next move is the same task.'}</Text>
-        {error ? <Text accessibilityLiveRegion="polite" style={styles.error}>{error}</Text> : null}
+        <Text style={t.dim}>{phase === 'work' ? title : 'Break'}</Text>
+        <Text style={styles.clock}>{mm}:{ss}</Text>
+        <Pressable
+          style={styles.stop}
+          onPress={async () => {
+            await writeSession(phase === 'work' ? left === 0 : true);
+            router.back();
+          }}
+        >
+          <Text style={{ color: '#fff', fontWeight: '600' }}>Stop</Text>
+        </Pressable>
       </View>
-      <View style={styles.actions}>
-        {phase === 'work' ? <><Button onPress={async () => { await finishWork(); track('session_completed', { plannedMins: minutes, completed: true }); }}>Finish block</Button><Button variant="secondary" onPress={interrupt}>I was interrupted · {interruptions}</Button></> : null}
-        {phase === 'break' ? <Button variant="secondary" onPress={() => { returnToTask(); router.back(); }}>Return early</Button> : null}
-        {phase === 'return' ? <Button onPress={() => { returnToTask(); router.back(); }}>Back to task</Button> : null}
-      </View>
-    </Screen>
+    </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
-  top: { paddingTop: spacing.lg, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
-  close: { width: 44, height: 44, borderRadius: 22, alignItems: 'center', justifyContent: 'center', backgroundColor: colors.paper },
-  label: { color: colors.moss, fontSize: 11, fontWeight: '900', letterSpacing: 1.8 },
-  center: { flex: 1, alignItems: 'center', justifyContent: 'center' },
-  title: { color: colors.ink, fontSize: 26, lineHeight: 32, fontWeight: '900', textAlign: 'center', maxWidth: 330 },
-  clock: { color: colors.ink, fontSize: 80, lineHeight: 92, letterSpacing: -4, fontVariant: ['tabular-nums'], fontWeight: '300', marginVertical: spacing.lg },
-  sub: { color: colors.muted, fontSize: 16, lineHeight: 24, textAlign: 'center' },
-  error: { color: colors.danger, backgroundColor: '#F8E4DE', borderRadius: radius.sm, padding: spacing.sm, marginTop: spacing.md },
-  actions: { gap: spacing.sm, paddingBottom: spacing.xl },
+  screen: { flex: 1, backgroundColor: c.bg },
+  center: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: 16 },
+  clock: { fontSize: 72, fontWeight: '700', color: c.text, fontVariant: ['tabular-nums'] },
+  stop: { backgroundColor: c.bad, borderRadius: 12, paddingHorizontal: 40, paddingVertical: 14 },
+  banner: { backgroundColor: c.accent, padding: 14, alignItems: 'center' },
 });

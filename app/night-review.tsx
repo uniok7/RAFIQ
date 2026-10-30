@@ -1,70 +1,146 @@
-import { useMemo, useState } from 'react';
-import { Pressable, StyleSheet, Text, View } from 'react-native';
-import { useQuery } from '@tanstack/react-query';
-import { router } from 'expo-router';
+// §9 Night review: routine, done ratio, tomorrow's first task, mood, roll forward.
+import { useRouter } from 'expo-router';
+import { useEffect, useMemo, useState } from 'react';
+import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
+import { computeObservations, plan, type Session } from '@/engine';
+import { GradientCTA } from '@/components/GradientCTA';
+import { Headline } from '@/components/Headline';
+import { track } from '@/lib/analytics';
+import { energyCorrectionCount } from '@/lib/recommendations';
+import { fetchChecks, fetchRoutine, setCheck, type RoutineItem } from '@/lib/routines';
+import { supabase } from '@/lib/supabase';
+import { c, t } from '@/lib/theme';
+import { today, useLocal } from '@/store/local';
 
-import { Button } from '@/src/components/button';
-import { Screen } from '@/src/components/screen';
-import { ENGINE_VERSION } from '@/src/engine';
-import { useAuth } from '@/src/hooks/use-auth';
-import { localDay, tomorrow } from '@/src/lib/dates';
-import { supabase } from '@/src/lib/supabase';
-import { useTaskStore } from '@/src/stores/task-store';
-import { colors, radius, spacing } from '@/src/theme/tokens';
-import type { Mood } from '@/src/types/domain';
-import { track } from '@/src/services/telemetry';
-
-const moods: { value: Mood; emoji: string; label: string }[] = [
-  { value: 'bad', emoji: '😞', label: 'Bad' }, { value: 'okay', emoji: '😐', label: 'Okay' }, { value: 'good', emoji: '🙂', label: 'Good' }, { value: 'great', emoji: '😄', label: 'Great' },
+const MOODS: Array<{ e: string; v: 'bad' | 'okay' | 'good' | 'great' }> = [
+  { e: '😣', v: 'bad' },
+  { e: '😐', v: 'okay' },
+  { e: '🙂', v: 'good' },
+  { e: '😄', v: 'great' },
 ];
 
-export default function NightReviewScreen() {
-  const { user } = useAuth();
-  const day = localDay();
-  const tasks = useTaskStore((state) => state.tasks).filter((task) => task.user_id === user?.id);
-  const updateTask = useTaskStore((state) => state.updateTask);
-  const [mood, setMood] = useState<Mood | null>(null);
-  const [checked, setChecked] = useState<string[]>([]);
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState('');
-  const routines = useQuery({
-    queryKey: ['routine-items', user?.id], enabled: Boolean(user),
-    queryFn: async () => { const { data, error } = await supabase.from('routine_items').select('*').eq('user_id', user!.id).eq('active', true).order('sort_order'); if (error) throw error; return data ?? []; },
-  });
-  const open = useMemo(() => tasks.filter((task) => task.status === 'open'), [tasks]);
-  const completedToday = useMemo(() => tasks.filter((task) => task.status === 'done' && task.done_at === day), [day, tasks]);
-  const plannedCount = Math.min(3, open.length + completedToday.length);
-  const completedCount = Math.min(plannedCount, completedToday.length);
-  const tomorrowTask = open[0] ?? null;
+function tomorrow(): string {
+  const d = new Date();
+  d.setDate(d.getDate() + 1);
+  return d.toISOString().slice(0, 10);
+}
 
-  function toggle(id: string) { setChecked((items) => items.includes(id) ? items.filter((item) => item !== id) : [...items, id]); }
+export default function NightReview() {
+  const router = useRouter();
+  const store = useLocal();
+  const day = today();
+  const [mood, setMood] = useState<'bad' | 'okay' | 'good' | 'great' | null>(null);
+  const [routine, setRoutine] = useState<RoutineItem[]>([]);
+  const [checked, setChecked] = useState<Set<string>>(new Set());
+
+  useEffect(() => {
+    if (!store.userId) return;
+    void fetchRoutine().then(setRoutine);
+    void fetchChecks(day).then(setChecked);
+  }, [store.userId, day]);
+
+  async function toggleCheck(itemId: string) {
+    const next = new Set(checked);
+    const on = !next.has(itemId);
+    on ? next.add(itemId) : next.delete(itemId);
+    setChecked(next); // immediate update
+    if (store.userId) await setCheck(store.userId, itemId, day, on);
+  }
+
+  const openToday = store.tasks.filter((x) => x.status === 'open' && x.due === day);
+  const tomorrowPlan = useMemo(() => plan(store.engineState(), tomorrow()), [store.tasks]);
 
   async function finish() {
-    if (!user || !mood) return;
-    setSaving(true); setError('');
-    const { error: closeError } = await supabase.rpc('close_day', { p_day: day, p_mood: mood, p_planned_count: plannedCount, p_completed_count: completedCount, p_checked_item_ids: checked, p_tomorrow_task_id: tomorrowTask?.id ?? null, p_engine_version: ENGINE_VERSION });
-    if (closeError) { setError(closeError.message); setSaving(false); return; }
-    for (const task of open.filter((item) => item.due === day)) updateTask(task.id, { due: tomorrow(day), reschedule_count: task.reschedule_count + 1 });
-    track('night_review_completed', { plannedCount, completedCount });
-    setSaving(false); router.back();
+    // Roll incomplete tasks due today → tomorrow, reschedule_count + 1 (§9).
+    for (const task of openToday) {
+      store.updateTask(task.id, { due: tomorrow(), reschedule_count: task.reschedule_count + 1 });
+    }
+
+    const planned = store.tasks.filter((x) => x.due === day).length;
+    const completed = store.tasks.filter((x) => x.due === day && x.status === 'done').length;
+
+    if (store.userId) {
+      await supabase.from('day_signals').upsert({
+        user_id: store.userId,
+        day,
+        mood,
+        planned_count: planned,
+        completed_count: completed,
+      });
+
+      // Recompute observations nightly and upsert (§8). estimate_multiplier (§8.1)
+      // needs completed sessions, which live server-side — hydrate them here, along
+      // with the energy-correction count for short_nights (§8.4).
+      const [{ data: sessions }, energyCorr] = await Promise.all([
+        supabase.from('sessions').select('*').eq('user_id', store.userId),
+        energyCorrectionCount(store.userId),
+      ]);
+      const fullState = { ...store.engineState(), sessions: (sessions as Session[]) ?? [] };
+      const obs = computeObservations(fullState, { energyCorrectionCount: energyCorr, day });
+      for (const o of obs) {
+        await supabase.from('observations').upsert(
+          { user_id: store.userId, ...o, updated_at: new Date().toISOString() },
+          { onConflict: 'user_id,key' },
+        );
+      }
+    }
+
+    track('night_review_completed');
+    router.replace('/(tabs)/today');
   }
 
   return (
-    <Screen eyebrow="Night review" title="Close the day">
-      <View style={styles.ratio}><Text style={styles.ratioValue}>{completedCount}/{plannedCount}</Text><Text style={styles.ratioLabel}>planned tasks completed</Text></View>
-      {routines.data?.length ? <View style={styles.section}><Text style={styles.sectionLabel}>ROUTINE</Text>{routines.data.map((item) => <Pressable key={item.id} onPress={() => toggle(item.id)} style={styles.routine}><View style={[styles.check, checked.includes(item.id) && styles.checked]} /> <Text style={styles.routineText}>{item.label}</Text></Pressable>)}</View> : <View style={styles.empty}><Text style={styles.emptyText}>Routine checks will appear here once you add them from You.</Text></View>}
-      <View style={styles.tomorrow}><Text style={styles.sectionLabel}>TOMORROW STARTS WITH</Text><Text style={styles.tomorrowTitle}>{tomorrowTask?.title ?? 'A clear slate'}</Text><Text style={styles.tomorrowBody}>Anything unfinished and due today moves forward once, with its reschedule count kept.</Text></View>
-      <View style={styles.section}><Text style={styles.sectionLabel}>HOW WAS TODAY?</Text><View style={styles.moods}>{moods.map((item) => <Pressable accessibilityLabel={item.label} accessibilityRole="button" key={item.value} onPress={() => setMood(item.value)} style={[styles.mood, mood === item.value && styles.moodSelected]}><Text style={styles.emoji}>{item.emoji}</Text><Text style={styles.moodLabel}>{item.label}</Text></Pressable>)}</View></View>
-      {error ? <Text accessibilityLiveRegion="polite" style={styles.error}>{error}</Text> : null}<Button disabled={!mood} loading={saving} onPress={finish}>Done for today</Button><Button variant="ghost" onPress={() => router.back()}>Not yet</Button>
-    </Screen>
+    <SafeAreaView style={styles.screen}>
+      <ScrollView contentContainerStyle={{ padding: 24, gap: 20 }}>
+        <Headline text="Close the {day}" />
+
+        {routine.length > 0 && (
+          <View style={styles.card}>
+            <Text style={t.dim}>Routine</Text>
+            {routine.map((it) => (
+              <Pressable key={it.id} style={styles.checkRow} onPress={() => toggleCheck(it.id)} accessibilityRole="checkbox" accessibilityState={{ checked: checked.has(it.id) }}>
+                <Text style={{ fontSize: 20 }}>{checked.has(it.id) ? '☑' : '☐'}</Text>
+                <Text style={t.body}>{it.label}</Text>
+              </Pressable>
+            ))}
+          </View>
+        )}
+
+        <View style={styles.card}>
+          <Text style={t.dim}>Done today</Text>
+          <Text style={t.h2}>
+            {store.tasks.filter((x) => x.due === day && x.status === 'done').length} /{' '}
+            {store.tasks.filter((x) => x.due === day).length}
+          </Text>
+        </View>
+
+        {tomorrowPlan.mainWin && (
+          <View style={styles.card}>
+            <Text style={t.dim}>Tomorrow, first thing</Text>
+            <Text style={t.h2}>{tomorrowPlan.mainWin.title}</Text>
+          </View>
+        )}
+
+        <View style={{ flexDirection: 'row', justifyContent: 'space-around' }}>
+          {MOODS.map((m) => (
+            <Pressable key={m.v} onPress={() => setMood(m.v)} style={[styles.mood, mood === m.v && styles.moodOn]}>
+              <Text style={{ fontSize: 32 }}>{m.e}</Text>
+            </Pressable>
+          ))}
+        </View>
+
+        <GradientCTA label="Done for today" onPress={finish} />
+      </ScrollView>
+    </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
-  ratio: { backgroundColor: colors.moss, borderRadius: radius.lg, padding: spacing.xl }, ratioValue: { color: colors.citrus, fontSize: 70, fontWeight: '900' }, ratioLabel: { color: colors.mossSoft, fontSize: 15 },
-  section: { marginTop: spacing.xl }, sectionLabel: { color: colors.moss, fontSize: 10, fontWeight: '900', letterSpacing: 1.6, marginBottom: spacing.sm },
-  routine: { flexDirection: 'row', alignItems: 'center', minHeight: 52, borderBottomWidth: 1, borderBottomColor: colors.line }, check: { width: 23, height: 23, borderRadius: 7, borderWidth: 2, borderColor: colors.moss, marginRight: spacing.md }, checked: { backgroundColor: colors.moss }, routineText: { color: colors.ink, fontSize: 16, fontWeight: '700' },
-  empty: { padding: spacing.md, borderWidth: 1, borderStyle: 'dashed', borderColor: colors.line, borderRadius: radius.md, marginTop: spacing.lg }, emptyText: { color: colors.muted, fontSize: 14, lineHeight: 21 },
-  tomorrow: { backgroundColor: colors.paper, borderRadius: radius.md, borderWidth: 1, borderColor: colors.line, padding: spacing.lg, marginTop: spacing.xl }, tomorrowTitle: { color: colors.ink, fontSize: 24, lineHeight: 30, fontWeight: '900' }, tomorrowBody: { color: colors.muted, fontSize: 14, lineHeight: 21, marginTop: spacing.sm },
-  moods: { flexDirection: 'row', justifyContent: 'space-between' }, mood: { width: '23%', alignItems: 'center', paddingVertical: spacing.md, borderRadius: radius.md, borderWidth: 1, borderColor: colors.line, backgroundColor: colors.paper }, moodSelected: { borderColor: colors.moss, backgroundColor: colors.mossSoft }, emoji: { fontSize: 27 }, moodLabel: { color: colors.muted, fontSize: 11, marginTop: spacing.xs }, error: { color: colors.danger, fontSize: 14, marginVertical: spacing.md },
+  screen: { flex: 1, backgroundColor: c.bg },
+  card: { backgroundColor: c.card, borderRadius: 12, padding: 16, gap: 4 },
+  checkRow: { flexDirection: 'row', alignItems: 'center', gap: 12, paddingVertical: 6 },
+  mood: { padding: 8, borderRadius: 12, borderWidth: 1, borderColor: 'transparent' },
+  moodOn: { borderColor: c.accent, backgroundColor: c.card },
+  btn: { backgroundColor: c.accent, borderRadius: 12, padding: 16 },
 });

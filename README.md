@@ -1,83 +1,103 @@
-# One Thing
+# Rafiq
 
-One Thing is a native iOS and Android planner that chooses one main win, sizes a focus block from explicit rules, works offline, and lets the user correct every important claim without writing an explanation.
+A personal decision engine (not a to-do list). Every morning it picks **one** main
+task, shows its reasoning, and sizes a work block to expected energy. When you flag
+tiredness it works a deterministic diagnostic ladder. It logs food as coarse, calorie-free
+ratings and folds timing into the plan. Every night it closes the day, rolls unfinished
+work forward, and takes a one-tap mood check-in.
 
-The application is implemented with Expo SDK 54, React Native 0.81, TypeScript, Expo Router, Zustand, React Query, Supabase, RevenueCat, Sentry, and PostHog. Anthropic is reachable only through an authenticated Supabase Edge Function; there is no model API key in the app bundle.
+Current spec: `../MASTER-BUILD-PROMPT.md` (Rafiq) — supersedes the earlier One Thing brief.
+This repo scaffolds M1–M7.
 
-## What is built
+## What runs today (no infra needed)
 
-- Pre-auth one-question onboarding with voice input, editable AI parsing, Apple/Google/magic-link auth, optional calendar and sleep permissions, and work-hour setup.
-- Offline-first task CRUD with optimistic local state, a persisted latest-write queue, reconnect sync, and per-user RLS.
-- Deterministic TypeScript planning engine for energy, task scoring, block sizing, top-two reasoning, due dates, rejection, and corrections.
-- HealthKit and Health Connect sleep reads, manual fallback, persistent focus/break timer, and a hard cap of three local notifications per day.
-- Night review, rollover transaction, routines, 14-day progress, 15-day evidence gating, observations, and natural-language plan actions.
-- Goals, progress, settings, permission controls, privacy summary, on-device JSON export, and cascading account deletion.
-- Seven app-managed free days with no purchase required up front. Day 8 keeps all existing data readable while new recommendations and AI actions require a RevenueCat entitlement.
-- Privacy-safe allowlisted analytics, crash reporting without default PII, CI, RLS isolation tests, and EAS build profiles.
-
-## Local setup
-
-Requirements: Node 20.19 or later, npm, a Supabase project, and an Expo development build. Expo Go is not sufficient because health, speech recognition, purchases, and other native modules are used.
-
-1. Copy `.env.example` to `.env` and fill in the public client values.
-2. Run `npm install`.
-3. Apply all files in `supabase/migrations` to the Supabase project.
-4. Configure Apple, Google, and magic-link auth with `onething://auth/callback` as an allowed redirect.
-5. Deploy the three Edge Functions and set their server-only secrets.
-6. Build and launch a development client with `eas build --profile development --platform ios` or `eas build --profile development --platform android`, then run `npx expo start --dev-client`.
-
-Useful checks:
-
-```text
-npm run verify
-npm run test:rls
-npx expo install --check
-npx expo config --type introspect
+```bash
+npm install          # first time
+npm run test:engine  # 77 unit tests: scoring, both energy paths + sleep-quality shift,
+                     # 15-day gate, the tired ladder, food timing, and the safety rails
+npm run typecheck    # strict TS
 ```
 
-The RLS test requires `SUPABASE_URL`, `SUPABASE_ANON_KEY`, and `SUPABASE_SERVICE_ROLE_KEY` and deliberately creates two temporary users to prove isolation across every user-owned table.
+The **decision engine** (`src/engine/`) is pure TypeScript with no React/Supabase/network
+imports — the core of the product, fully unit-tested. Start reading at
+[`src/engine/plan.ts`](src/engine/plan.ts).
 
-## Environment and secrets
+## What needs your accounts/machines
 
-Client-safe values:
+| Piece | Needs |
+|---|---|
+| Auth, DB, RLS | A Supabase project. Apply `supabase/migrations/0001_init.sql`. |
+| Two-user RLS isolation test (§3) | Live Supabase + `SUPABASE_*` env → `npm run test:rls` (CI-gated). |
+| LLM proxy (§6) | Deploy `supabase/functions/llm`; set `ANTHROPIC_API_KEY` as a secret. |
+| Sleep (§11) | iOS dev build (Mac + Xcode, HealthKit) / Android dev build (Health Connect). Not Expo Go. |
+| Payments / errors / analytics | RevenueCat, Sentry, PostHog keys. |
 
-- `EXPO_PUBLIC_SUPABASE_URL`
-- `EXPO_PUBLIC_SUPABASE_ANON_KEY`
-- `EXPO_PUBLIC_REVENUECAT_IOS_KEY`
-- `EXPO_PUBLIC_REVENUECAT_ANDROID_KEY`
-- `EXPO_PUBLIC_REVENUECAT_ENTITLEMENT_ID` (defaults to `pro`)
-- `EXPO_PUBLIC_SENTRY_DSN`
-- `EXPO_PUBLIC_POSTHOG_KEY`
-- `EXPO_PUBLIC_POSTHOG_HOST`
+### Setup
 
-Edge Function or CI secrets—never prefix these with `EXPO_PUBLIC_`:
+1. `cp .env.example .env` and fill `EXPO_PUBLIC_*`.
+2. Create a Supabase project; run the migration; deploy the three Edge Functions
+   (`llm`, `delete-account`, `export-data`) and set their secrets:
+   ```bash
+   supabase secrets set ANTHROPIC_API_KEY=... SUPABASE_SERVICE_ROLE_KEY=... REVENUECAT_SECRET_KEY=...
+   ```
+3. Build a dev client (HealthKit/Health Connect are native): `eas build --profile development`.
+4. `npm start` and open in the dev client.
 
-- `SUPABASE_SERVICE_ROLE_KEY`
-- `ANTHROPIC_API_KEY`
-- `REVENUECAT_V1_SECRET_API_KEY`
-- `REVENUECAT_ENTITLEMENT_ID`
-- `REVENUECAT_WEBHOOK_AUTH`
+## Visual language
 
-For symbolicated production crashes, add `SENTRY_AUTH_TOKEN`, `SENTRY_ORG`, and `SENTRY_PROJECT` as sensitive EAS build variables. The public DSN alone is enough for local integration testing but not source-map upload.
+The UI takes its look — not its features — from an OxeAI reference: near-black ground,
+violet accent, soft rounded cards, one accent word per headline, gradient heroes and CTAs,
+progress rings. Feature set is unchanged from the spec (no nutrition/workout/body-comp).
+Tokens live in [`src/lib/theme.ts`](src/lib/theme.ts); reusable primitives in `src/components/`
+(`Headline`, `GradientCTA`, `SegmentedControl`, `ProgressRing`). Needs `expo-linear-gradient`
+and `react-native-svg` (in package.json).
 
-## RevenueCat setup
+## Layout
 
-Create iOS and Android subscription products, attach them to the `pro` entitlement, and add monthly and/or annual packages to the current offering. The first seven days are controlled by the app and server and do not initiate a store purchase. Configure the RevenueCat webhook URL as:
-
-```text
-https://<project-ref>.supabase.co/functions/v1/revenuecat-webhook
+```
+src/engine/        pure decision engine (§5) + observations (§8) + tests   ← the product
+src/lib/           supabase, llm, health, notifications, auth, purchases, analytics, theme
+src/store/local.ts offline-first store: local writes queue + sync on reconnect (§2)
+src/components/     CorrectableClaim (§7), EmptyState (§9)
+app/               expo-router screens: onboarding, (tabs)/{today,goals,assistant,progress,you}, timer, night-review
+supabase/          migration + RLS, three Edge Functions, two-user isolation test
 ```
 
-Set its Authorization header to the exact value stored in `REVENUECAT_WEBHOOK_AUTH`. The authenticated `account` function also performs a server-side entitlement refresh immediately after purchase or restore.
+## Milestone status
 
-## Release
+- **M1 Skeleton** — schema+RLS+isolation test, auth, Today CRUD, offline queue: **scaffolded**.
+- **M2 Sessions/health** — timer+break+return, `sessions` rows, sleep read: **scaffolded** (needs dev build to verify).
+- **M3 Onboarding** — LLM proxy + Job A + editable plan + escape hatch: **scaffolded**.
+- **M4 Engine** — `src/engine/` + tests, morning card, block sizing, night rollover, recs logged: **done + tested**.
+- **M5 Corrections** — all four correction types, Job B, weight adaptation, nightly observations w/ 15-day gate: **scaffolded**.
+- **M6 Shell** — Goals/Progress/You, export+delete, RevenueCat, Sentry, PostHog, CI: **scaffolded**.
 
-The source is ready for EAS development, preview, and production builds. Store signing, product metadata, sandbox accounts, TestFlight submission, and Play internal-track submission require the owner’s Apple, Google, Expo, Supabase, RevenueCat, Sentry, and PostHog credentials. Follow [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md) and complete the physical-device matrix in [docs/M2_DEVICE_TEST.md](docs/M2_DEVICE_TEST.md) before release.
+## Known deferrals (marked in code with `ponytail:`)
 
-## Architecture note
+- SecureStore session adapter uses direct storage (2KB ceiling); upgrade to AES-in-AsyncStorage only if tokens outgrow it.
+- Apple/Google native id-token providers need wiring in the dev build; the Supabase exchange is in `src/lib/auth.ts`.
+- Paywall packages, purchase, and the day-8 trigger are wired but only exercise once RevenueCat keys + offerings exist.
 
-SDK 54 is intentionally pinned with `newArchEnabled: false`: it is the last Expo SDK that can run the legacy architecture required by `react-native-health`. This is a constrained compatibility bridge, not a long-term upgrade path. Before moving to SDK 55+, replace the Apple Health library with a maintained New-Architecture-compatible implementation, then re-enable the New Architecture and rerun the physical-device matrix.
+## Rafiq additions (M7 + engine deltas)
 
-The unused `react-native-reanimated` 4 and `react-native-worklets` template packages have been removed because Reanimated 4 requires the New Architecture. `npx expo install --check` confirms that the remaining SDK 54 dependencies are current.
+Built though the spec sequences M7 **after** the day-14 retention decision — noted here so
+it's a deliberate call, not an oversight.
 
-`npm audit --omit=dev` currently reports 26 transitive advisories (17 moderate, 9 high) in the pinned Expo/Metro/config-plugin toolchain and its health config-plugin path. npm offers only incompatible major-version changes—primarily Expo 57—to clear them. No forced audit fix was applied because Expo 55+ removes the legacy architecture required by the specified Apple Health library. Reassess this exception when replacing that library.
+- **Engine** (all pure + tested): sleep-quality shift in `energy.ts` (§5.1); the deterministic
+  **tired ladder** `tired.ts` (§6, 7 rules, stop-at-first, honest null fallback);
+  **food** `food.ts` (borrowed-prior nudges + the 20-day `meal_timing` observation, §7/§9);
+  **safety** `safety.ts` (§12) — two-sentence `foodReply`, `dailyGap`, `disorderedEatingGuard`,
+  `isRedFlag`. No calories, supplement names, or deficiency claims anywhere — asserted in tests.
+- **DB**: `0002_rafiq.sql` adds `meals`, `tired_events`, `day_signals.sleep_quality` +
+  `tired_reports`, `profiles.food_commentary_enabled`; the RLS isolation test now covers all of them.
+- **LLM**: Job D (meal parse) in the Edge Function; Job B gains `log_meal` / `tired` + `mealText`.
+- **Screens**: sleep-quality pills + food row + food nudges + daily gap on Today; the Tired sheet
+  (`app/tired.tsx`); meal logging, tired routing, and red-flag escalation in the AI sheet.
+- **Guard shipped with the feature**: 0–1 meals for 3 straight days flips `food_commentary_enabled`
+  off permanently (logging continues silently) — enforced in the store on every meal add.
+
+## Built out
+
+- **Routine** — editor on You (`RoutineEditor`), checkboxes in Night review, persisted to `routine_items` / `routine_checks`.
+- **Paywall** (§12) — `app/paywall.tsx`, shown on day 8 when the trial has lapsed and no entitlement, dismissible (never blocks reads). `trial_started` / `subscribed` tracked.
+- **§5.7 stop rule** — the energy call is logged as a recommendation; a `wrong_inference` correction attaches to it, 3 distinct correction-days flip `short_nights`, softening the low-energy call (§5.2) and showing the "I'll stop" banner on Today.
